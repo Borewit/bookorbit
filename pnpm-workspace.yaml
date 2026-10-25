@@ -111,3 +111,4 @@ minimumReleaseAgeExclude:
   - "@oxlint/binding-win32-x64-msvc@1.90.0"
   - eslint-plugin-oxlint@1.90.0
   - oxlint@1.90.0
+  - music-metadata@12.3.5

@@ -1,16 +1,40 @@
-import { execFile as execFileCallback, spawn } from 'child_process';
-import { promisify } from 'util';
+import sharp from 'sharp';
+import { parseFile, selectCover, TrackType, type IAudioMetadata, type IChapter, type IOptions } from 'music-metadata';
 import { parseSeriesIndex as parseSeriesIndexLabel, type AudiobookChapter } from '@bookorbit/types';
 import { parsePublishedDateKey, parsePublishedYear, publishedYearFromDateKey } from '../../../common/utils/published-date.utils';
 
-const execFile = promisify(execFileCallback);
-
-const FFPROBE_PATH = process.env.FFPROBE_PATH?.trim() || 'ffprobe';
-const FFMPEG_PATH = process.env.FFMPEG_PATH?.trim() || 'ffmpeg';
-// A chapter-rich audiobook prints far more than execFile's 1 MB default, and an overflow there
-// would surface as a failed read of a perfectly good file.
-const FFPROBE_OUTPUT_MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const MAX_EMBEDDED_COVER_BYTES = 32 * 1_024 * 1_024;
+const CUSTOM_AUDIO_TAGS = new Set([
+  'series',
+  'series-part',
+  'part',
+  'series_part',
+  'seriespart',
+  'show',
+  'episode_id',
+  'episode_sort',
+  'audible_asin',
+  'librofm_isbn',
+  'publisher',
+  'subtitle',
+]);
+// Match parser source precedence while reading only primary credits, not supplemental artist aliases.
+const PERSON_TAG_SOURCES = ['APEv2', 'vorbis', 'ID3v2.4', 'ID3v2.3', 'ID3v2.2', 'iTunes', 'ID3v1'] as const;
+const PERSON_TAG_IDS = {
+  artist: new Set(['artist', 'tpe1', 'tp1', '©art']),
+  albumartist: new Set(['albumartist', 'album_artist', 'album artist', 'tpe2', 'tp2', 'aart']),
+};
+const SUPPLEMENTARY_PERSON_TAG_IDS = {
+  artist: new Set(['artists', 'discogs_artists', 'discogs_artist_name']),
+  albumartist: new Set(['albumartists', 'discogs_album_artists']),
+};
+const DESCRIPTION_TAGS = new Set(['comment', 'description', 'lyrics', 'synopsis']);
+const AUDIO_PARSE_OPTIONS: IOptions = {
+  duration: true,
+  maxMemoryAllocation: 64 * 1_024 * 1_024,
+  maxMetadataEntries: 100_000,
+  maxChapterCount: 100_000,
+};
 
 export interface AudioExtractResult {
   title: string | null;
@@ -37,40 +61,13 @@ export interface AudioChapterProbe {
   durationMs: number | null;
 }
 
-interface FfprobeStream {
-  codec_type: string;
-  codec_name: string;
-  tags?: Record<string, string>;
-}
-
-interface FfprobeChapter {
-  start_time: string;
-  tags?: Record<string, string>;
-}
-
-interface FfprobeOutput {
-  format?: {
-    duration?: string;
-    tags?: Record<string, string>;
-  };
-  streams?: FfprobeStream[];
-  chapters?: FfprobeChapter[];
-}
-
 // Null means the file could not be read, which is not the same as a file that carries no tags:
 // callers persist what they get, so a failed read must never be mistaken for empty metadata.
 export async function extractAudioMetadata(absolutePath: string, options: { cover?: boolean } = {}): Promise<AudioExtractResult | null> {
   try {
-    const { stdout } = await execFile(
-      FFPROBE_PATH,
-      ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_chapters', '-show_streams', absolutePath],
-      { timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: FFPROBE_OUTPUT_MAX_BUFFER_BYTES },
-    );
-
-    const data: FfprobeOutput = JSON.parse(stdout);
-    const tags = normalizeTags(data.format?.tags ?? {});
-    const streams = data.streams ?? [];
-    const chapters = data.chapters ?? [];
+    const metadata = await readAudio(absolutePath, { includeChapters: true });
+    if (!metadata) return null;
+    const tags = metadataTags(metadata);
 
     const rawAlbumArtist = tagValue(tags, 'albumartist') ?? tagValue(tags, 'album_artist');
     const rawArtist = tagValue(tags, 'artist');
@@ -97,7 +94,7 @@ export async function extractAudioMetadata(absolutePath: string, options: { cove
       tagValue(tags, 'lyrics'),
       tagValue(tags, 'synopsis'),
     );
-    const language = resolveLanguage(tags, streams);
+    const language = resolveLanguage(tags, metadata);
     const seriesName = tagValue(tags, 'series') ?? tagValue(tags, 'show');
     const seriesIndex = parseSeriesIndex(
       tagValue(tags, 'series-part') ??
@@ -110,11 +107,11 @@ export async function extractAudioMetadata(absolutePath: string, options: { cove
     const genres = splitTagList(tagValue(tags, 'genre'), ';');
     const audibleId = tagValue(tags, 'asin') ?? tagValue(tags, 'audible_asin');
     const librofmId = tagValue(tags, 'librofm_isbn');
-    const durationSeconds = parseDurationSeconds(data.format?.duration);
+    const durationSeconds = roundedDuration(audioDuration(metadata), 1);
 
-    const mappedChapters = mapChapters(chapters);
+    const mappedChapters = mapChapters(metadata.format.chapters ?? []);
 
-    const coverBytes = options.cover === false ? null : await extractCoverBytes(absolutePath, streams);
+    const coverBytes = options.cover === false ? null : await extractCoverBytes(metadata);
 
     return {
       title,
@@ -142,97 +139,127 @@ export async function extractAudioMetadata(absolutePath: string, options: { cove
 
 export async function parseAudioDuration(absolutePath: string): Promise<number | null> {
   try {
-    const { stdout } = await execFile(FFPROBE_PATH, ['-v', 'quiet', '-print_format', 'json', '-show_format', absolutePath], {
-      timeout: 30_000,
-      killSignal: 'SIGKILL',
-      maxBuffer: FFPROBE_OUTPUT_MAX_BUFFER_BYTES,
-    });
-    const data: FfprobeOutput = JSON.parse(stdout);
-    return parseDurationSeconds(data.format?.duration);
+    const metadata = await readAudio(absolutePath, { skipCovers: true });
+    return metadata ? roundedDuration(audioDuration(metadata), 1) : null;
   } catch {
     return null;
   }
 }
 
-// Chapters and length only: the merge pass for multi-file audiobooks needs both from every file,
-// and a full extract would also pull tags and cover art it has no use for.
+// Keep millisecond precision here: rounding each file to seconds compounds chapter offsets.
 export async function probeAudioChapters(absolutePath: string): Promise<AudioChapterProbe> {
   try {
-    const { stdout } = await execFile(FFPROBE_PATH, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_chapters', absolutePath], {
-      timeout: 30_000,
-      killSignal: 'SIGKILL',
-      maxBuffer: FFPROBE_OUTPUT_MAX_BUFFER_BYTES,
-    });
-    const data: FfprobeOutput = JSON.parse(stdout);
-    return { chapters: mapChapters(data.chapters ?? []), durationMs: parseDurationMs(data.format?.duration) };
+    const metadata = await readAudio(absolutePath, { includeChapters: true, skipCovers: true });
+    if (!metadata) return { chapters: [], durationMs: null };
+    return { chapters: mapChapters(metadata.format.chapters ?? []), durationMs: roundedDuration(audioDuration(metadata), 1000) };
   } catch {
     return { chapters: [], durationMs: null };
   }
 }
 
-function mapChapters(chapters: FfprobeChapter[]): AudiobookChapter[] {
-  return chapters.flatMap((ch) => {
-    const startMs = parseChapterStartMs(ch.start_time);
-    if (startMs === null) return [];
-    return [{ title: ch.tags?.title ?? '', startMs }];
+function mapChapters(chapters: readonly IChapter[]): AudiobookChapter[] {
+  return chapters.flatMap((chapter) => {
+    const scale = chapter.timeScale ?? 1;
+    const startMs = Math.round((chapter.start / scale) * 1000);
+    if (!Number.isFinite(scale) || scale <= 0 || !Number.isSafeInteger(startMs) || startMs < 0) return [];
+    return [{ title: chapter.title ?? '', startMs }];
   });
 }
 
-/** Reads only the embedded picture, for callers that need a cover without the rest of the tags. */
 export async function extractAudioCover(absolutePath: string): Promise<Buffer | null> {
   try {
-    const { stdout } = await execFile(FFPROBE_PATH, ['-v', 'quiet', '-print_format', 'json', '-show_streams', absolutePath], {
-      timeout: 30_000,
-      killSignal: 'SIGKILL',
-      maxBuffer: FFPROBE_OUTPUT_MAX_BUFFER_BYTES,
-    });
-    const data: FfprobeOutput = JSON.parse(stdout);
-    return await extractCoverBytes(absolutePath, data.streams ?? []);
+    const metadata = await readAudio(absolutePath, { duration: false });
+    return metadata ? await extractCoverBytes(metadata) : null;
   } catch {
     return null;
   }
 }
 
-async function extractCoverBytes(absolutePath: string, streams: FfprobeStream[]): Promise<Buffer | null> {
-  const hasEmbeddedImage = streams.some((s) => s.codec_type === 'video');
-  if (!hasEmbeddedImage) return null;
-
-  return new Promise<Buffer | null>((resolve) => {
-    const chunks: Buffer[] = [];
-    let totalBytes = 0;
-    let settled = false;
-    const proc = spawn(FFMPEG_PATH, ['-y', '-i', absolutePath, '-map', '0:v', '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1'], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-
-    const finish = (value: Buffer | null) => {
-      if (settled) return;
-      settled = true;
-      resolve(value);
-    };
-    proc.stdout.on('data', (chunk: Buffer) => {
-      totalBytes += chunk.length;
-      if (totalBytes > MAX_EMBEDDED_COVER_BYTES) {
-        proc.kill();
-        chunks.length = 0;
-        finish(null);
-        return;
-      }
-      chunks.push(chunk);
-    });
-    proc.on('close', (code) => {
-      if (code === 0 && chunks.length > 0) {
-        finish(Buffer.concat(chunks, totalBytes));
-      } else {
-        finish(null);
-      }
-    });
-    proc.on('error', () => finish(null));
-  });
+async function readAudio(absolutePath: string, options: IOptions = {}): Promise<IAudioMetadata | null> {
+  const metadata = await parseFile(absolutePath, { ...AUDIO_PARSE_OPTIONS, ...options });
+  if (
+    metadata.format.hasAudio === false ||
+    (options.includeChapters && metadata.quality.warnings.some((warning) => /chapter limit/i.test(warning.message)))
+  ) {
+    return null;
+  }
+  return metadata;
 }
 
-function normalizeTags(tags: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(Object.entries(tags).map(([k, v]) => [k.toLowerCase(), v]));
+async function extractCoverBytes(metadata: IAudioMetadata): Promise<Buffer | null> {
+  const cover = selectCover(metadata.common.picture);
+  if (!cover || cover.data.byteLength === 0 || cover.data.byteLength > MAX_EMBEDDED_COVER_BYTES) return null;
+  const bytes = Buffer.from(cover.data);
+  try {
+    await sharp(bytes, { failOn: 'error' }).metadata();
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+function audioDuration(metadata: IAudioMetadata): number | undefined {
+  return metadata.format.containerDuration ?? metadata.format.duration;
+}
+
+function roundedDuration(duration: number | undefined, scale: number): number | null {
+  return duration !== undefined && Number.isFinite(duration) && duration >= 0 ? Math.round(duration * scale) : null;
+}
+
+function metadataTags(metadata: IAudioMetadata): Record<string, string> {
+  const { common } = metadata;
+  const tags: Record<string, string> = Object.create(null) as Record<string, string>;
+  const commonTags = {
+    title: common.title,
+    album: common.album,
+    albumartist: primaryPersonTag(metadata, 'albumartist') ?? common.albumartist ?? common.albumartists?.join(';'),
+    artist: primaryPersonTag(metadata, 'artist') ?? common.artist ?? common.artists?.join(';'),
+    composer: common.composer?.join(';'),
+    publisher: (common.publisher ?? common.label)?.join(';'),
+    subtitle: common.subtitle?.join(';'),
+    date: common.date ?? common.year?.toString(),
+    comment: resolveDescription(...(common.comment ?? []).map((comment) => comment.text)),
+    description: resolveDescription(...(common.description ?? [])),
+    lyrics: resolveDescription(...(common.lyrics ?? []).map((lyrics) => lyrics.text)),
+    synopsis: common.longDescription,
+    language: common.language,
+    genre: common.genre?.join(';'),
+    asin: common.asin,
+    show: common.tvShow,
+    episode_id: common.tvEpisodeId,
+  };
+  for (const [key, value] of Object.entries(commonTags)) {
+    if (value !== undefined && value !== null) tags[key] = value;
+  }
+  // Common tags do not cover application-specific fields such as series and Libro.fm ISBN.
+  for (const entries of Object.values(metadata.native)) {
+    for (const { id, value } of entries) {
+      if (typeof value !== 'string') continue;
+      const key = id.replace(/^mdta:|^TXXX:|^----:[^:]+:/i, '').toLowerCase();
+      if (CUSTOM_AUDIO_TAGS.has(key) || tags[key] === undefined) {
+        tags[key] = value;
+      } else if (DESCRIPTION_TAGS.has(key)) {
+        tags[key] = resolveDescription(tags[key], value) ?? '';
+      }
+    }
+  }
+  return tags;
+}
+
+function primaryPersonTag(metadata: IAudioMetadata, field: keyof typeof PERSON_TAG_IDS): string | undefined {
+  for (const source of PERSON_TAG_SOURCES) {
+    const primary: string[] = [];
+    const supplementary: string[] = [];
+    for (const { id, value } of metadata.native[source] ?? []) {
+      if (typeof value !== 'string' || !value.trim()) continue;
+      const key = id.replace(/^mdta:/i, '').toLowerCase();
+      if (PERSON_TAG_IDS[field].has(key)) primary.push(value);
+      else if (SUPPLEMENTARY_PERSON_TAG_IDS[field].has(key.replace(/^txxx:|^----:[^:]+:/, ''))) supplementary.push(value);
+    }
+    if (primary.length > 0) return primary.join(';');
+    if (supplementary.length > 0) return supplementary.join(';');
+  }
+  return undefined;
 }
 
 function tagValue(tags: Record<string, string>, key: string): string | null {
@@ -274,43 +301,22 @@ function escapeCharClass(value: string): string {
   return value.replace(/[\\\]^/-]/g, '\\$&');
 }
 
-function parseDurationSeconds(raw: string | undefined): number | null {
-  if (!raw) return null;
-  const parsed = Number.parseFloat(raw);
-  return Number.isFinite(parsed) ? Math.round(parsed) : null;
-}
-
-// Milliseconds, not the rounded seconds stored per file: chapter offsets accumulate across files,
-// so half-second rounding errors would compound down the book.
-function parseDurationMs(raw: string | undefined): number | null {
-  if (!raw) return null;
-  const parsed = Number.parseFloat(raw);
-  return Number.isFinite(parsed) ? Math.round(parsed * 1000) : null;
-}
-
-function parseChapterStartMs(raw: string): number | null {
-  const parsed = Number.parseFloat(raw);
-  return Number.isFinite(parsed) ? Math.round(parsed * 1000) : null;
-}
-
 function parseSeriesIndex(raw: string | null): string | null {
   if (!raw) return null;
   return parseSeriesIndexLabel(raw);
 }
 
-function resolveDescription(...values: (string | null)[]): string | null {
+function resolveDescription(...values: (string | null | undefined)[]): string | null {
   return values.filter((value): value is string => Boolean(value)).sort((a, b) => b.length - a.length)[0] ?? null;
 }
 
-function resolveLanguage(tags: Record<string, string>, streams: FfprobeStream[]): string | null {
-  const formatLanguage = normalizeLanguageValue(tagValue(tags, 'language'));
-  if (formatLanguage) return formatLanguage;
-  for (const stream of streams) {
-    const streamTags = normalizeTags(stream.tags ?? {});
-    const streamLanguage = normalizeLanguageValue(tagValue(streamTags, 'language'));
-    if (stream.codec_type === 'audio' && streamLanguage) {
-      return streamLanguage;
-    }
+function resolveLanguage(tags: Record<string, string>, metadata: IAudioMetadata): string | null {
+  const language = normalizeLanguageValue(tagValue(tags, 'language'));
+  if (language) return language;
+  for (const track of metadata.format.trackInfo ?? []) {
+    if (track.type !== TrackType.audio) continue;
+    const trackLanguage = normalizeLanguageValue(track.language ?? null);
+    if (trackLanguage) return trackLanguage;
   }
   return null;
 }

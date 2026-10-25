@@ -99,7 +99,7 @@ export class MetadataExtractionService {
     return { metadata: null, cover };
   }
 
-  /** Reads only a file's embedded cover. KEPUB is an EPUB container, and audio art comes from ffmpeg. */
+  /** Reads only a file's embedded cover. KEPUB is an EPUB container, and audio art is read directly from embedded pictures. */
   async extractEmbeddedCover(absolutePath: string, format: string): Promise<Buffer | null> {
     const normalized = format.toLowerCase();
     if (normalized === 'djvu') return this.djvu.extractCover(absolutePath);

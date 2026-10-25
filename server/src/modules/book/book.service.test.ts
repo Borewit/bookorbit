@@ -5476,6 +5476,77 @@ describe('BookService', () => {
       ]);
     });
 
+    it('loads tagged Opus metadata from the primary file through the real reader (#1447)', async () => {
+      const { mkdtemp, rm } = await vi.importActual<typeof import('fs/promises')>('fs/promises');
+      const { createRequire } = await import('module');
+      const { execFileSync } = await import('child_process');
+      const { extractAudioMetadata: readAudio } = await vi.importActual<typeof import('../metadata/extractors/audio.extractor')>(
+        '../metadata/extractors/audio.extractor',
+      );
+      const requirePackage = createRequire(import.meta.url);
+      const ffmpeg = (requirePackage('@ffmpeg-installer/ffmpeg') as { path: string }).path;
+      const directory = await mkdtemp(join(tmpdir(), 'bookorbit-opus-file-metadata-'));
+      try {
+        const absolutePath = join(directory, 'blinkist-style.opus');
+        execFileSync(
+          ffmpeg,
+          [
+            '-v',
+            'error',
+            '-y',
+            '-f',
+            'lavfi',
+            '-i',
+            'sine=frequency=440:duration=1.25',
+            '-c:a',
+            'libopus',
+            '-metadata',
+            'title=Track title',
+            '-metadata',
+            'album=Test audiobook',
+            '-metadata',
+            'artist=Test Author',
+            '-metadata',
+            'composer=Test Narrator',
+            '-metadata',
+            'description=Regression description',
+            '-metadata',
+            'publisher=Test Publisher',
+            '-metadata',
+            'language=eng',
+            '-metadata',
+            'date=2024-03-21',
+            '-metadata',
+            'genre=Nonfiction',
+            absolutePath,
+          ],
+          { timeout: 10_000 },
+        );
+        const { service, bookRepo } = makeService();
+        const user = makeUser();
+        const access = vi.spyOn(service, 'verifyBookAccess').mockResolvedValue(undefined);
+        bookRepo.findPrimaryFile.mockResolvedValue({ absolutePath, format: 'opus' });
+        mockExtractAudioMetadata.mockImplementation(readAudio);
+
+        await expect(service.getMetadataFromFile(5, user)).resolves.toMatchObject({
+          title: 'Test audiobook',
+          authors: ['Test Author'],
+          narrators: ['Test Narrator'],
+          description: 'Regression description',
+          publisher: 'Test Publisher',
+          language: 'eng',
+          publishedDate: '2024-03-21',
+          publishedYear: 2024,
+          genres: ['Nonfiction'],
+          durationSeconds: 1,
+        });
+        expect(access).toHaveBeenCalledWith(5, user);
+        expect(mockExtractAudioMetadata).toHaveBeenCalledWith(absolutePath);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+
     it('getMetadataFromFile handles missing or unsupported primary files', async () => {
       const { service, bookRepo } = makeService();
       const user = makeUser();
